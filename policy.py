@@ -28,9 +28,9 @@ class Policy(tf_policy.TFPolicy):
             self.du = 1
         self.obs_cost, self.act_cost, self.obs_preproc = get_env_cost(env)
         if self.obs_preproc is not None:
-           self.do =  self.obs_preproc(np.ones([1, self.do])).shape[-1]
+           self.do_preproc =  self.obs_preproc(np.ones([1, self.do])).shape[-1]
         self.k = k
-        self.model = get_model(model, self.num_nets, self.du, self.do, k)
+        self.model = get_model(model, self.num_nets, self.du, self.do, self.do_preproc, k)
         self.a_sampler = get_a_sampler(a_sampler, action_spec)
         self.ts_sampler = get_ts_sampler(ts_sampler)
         self.plan_hor = plan_hor
@@ -49,33 +49,26 @@ class Policy(tf_policy.TFPolicy):
         # Cast to work with DNN
         act_seq = tf.cast(act_seq, tf.float32)
         obs = tf.cast(time_step.observation[None, ...], tf.float32)
-        #if self.du==1:
-        #    act_seq = act_seq[..., None]
         act_seq = tf.clip_by_value(act_seq, self.act_min, self.act_max)
-        #obs = tf.reshape(tf.tile(time_step.observation, [self.pop_size*self.npart, 1]), 
-        #            [self.pop_size, self.npart, -1])
 
         obs = tf.tile(obs, [self.pop_size, self.npart, 1]) 
-        obs = self.obs_preproc(obs)
         cost = tf.zeros([self.pop_size, self.npart], tf.float32)
         for act in act_seq:
-            cost += self.act_cost(act) 
-            cost += self.obs_cost(obs)
-            #cost += self.act_cost(act) + self.obs_cost(obs)
-            obs = self.ts_sampler(self.model, obs, act, self.pop_size, self.npart, 
+            cost += self.act_cost(act) + self.obs_cost(obs)
+            pre_obs = self.obs_preproc(obs)
+            obs = self.ts_sampler(self.model, pre_obs, obs, act, self.pop_size, self.npart, 
                     self.num_nets, self.k, self.calibrator, self.inv_cal)
+        
+        # Assign high cost to nan values
+        cost = tf.where(tf.math.is_nan(cost), 1e6 * tf.ones_like(cost), cost)
         idx = tf.argmin(tf.reduce_mean(cost, axis=1))
         act = act_seq[0, idx, 0, :]
 
         outer_dims = nest_utils.get_outer_shape(time_step, self._time_step_spec)
-        #action_ = tf.cast(action_spec.minimum, action_spec.dtype)
         
         # Cast to take step
-        # Before it was and worked with carpole:action_ = tf.cast(act, action_spec.dtype) 
         action_ = tf.cast(act[None, ...], action_spec.dtype)
-        # TODO: Check if action is valid 
-        policy_info = tensor_spec.sample_spec_nest(
-          self._info_spec, outer_dims=outer_dims)
+        policy_info = tensor_spec.sample_spec_nest(self._info_spec, outer_dims=outer_dims)
         step = policy_step.PolicyStep(action_, policy_state, policy_info)
         return step 
 

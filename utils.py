@@ -11,6 +11,7 @@ from argparse import ArgumentParser
 from tf_agents.environments import batched_py_environment
 from tf_agents.environments import tf_py_environment
 from tf_agents.environments import suite_gym
+from tf_agents.environments import suite_mujoco
 from pynverse import inversefunc
 
 tfk = tf.keras
@@ -28,17 +29,19 @@ class FC(keras.layers.Layer):
     Returns:
         `tf.Tensor`. Output of dense connection.
     """
-    def __init__(self, units, num_nets, feat_size, activation=tf.nn.sigmoid):
+    def __init__(self, units, num_nets, feat_size, activation=tf.nn.sigmoid, kernel_regularizer=None):
         super(FC, self).__init__()
         self.units = units
         self.num_nets = num_nets
         self.feat_size = feat_size
         self.activation = activation
+        self.kernel_regularizer = kernel_regularizer
 
         self.w = self.add_weight(
             shape=(self.num_nets, self.feat_size, self.units),
             initializer="random_normal",
             trainable=True,
+            regularizer=self.kernel_regularizer,
             name="w"
         )
         self.b = self.add_weight(
@@ -88,7 +91,7 @@ def get_env(env='cartpole'):
     if env=='cartpolem':
         env = suite_gym.load('InvertedPendulum-v2')
     if env=='pusher':
-        env = suite_gym.load('FetchPush-v1')
+        env = suite_mujoco.load('Pusher-v2')
     if env=='cheetah':
         env = suite_gym.load('HalfCheetah-v2')
     if env=='reacher':
@@ -96,7 +99,7 @@ def get_env(env='cartpole'):
     return tf_py_environment.TFPyEnvironment(env), env
     #return env
 
-def get_model(model, num_nets, du, do, k, hidden_size=32):
+def get_model(model, num_nets, du, do, do_preproc, k, hidden_size=100):
     """ To add reward function simply do do+=1. And concatenate the appropiate output.
     """
     if model[0]=="P":
@@ -113,28 +116,22 @@ def get_model(model, num_nets, du, do, k, hidden_size=32):
                     reinterpreted_batch_ndims=1), 
                 mixture_distribution =tfd.Categorical(probs=tf.nn.softmax(t[..., do*2*k:])))
 
-    #TODO: Lern full covariance
-    # G = lambda t: tfd.MultivariateNormalDiag(loc = t[..., :do], scale_diag=t[..., do:])
-
-    # if k == 1:
-    #     make_distribution_fn = G
-    #     fc_output = do*2
-    # else:
-    #     make_distribution_fn = GMM
-    #     fc_output = do*2*k + k 
-    
     make_distribution_fn = GMM
     fc_output = do*2*k + k 
 
     ps_as = tfk.models.Sequential([
-            FC(hidden_size, num_nets, du+do, activation=tf.nn.sigmoid),
-            FC(fc_output, num_nets, hidden_size, activation=None),
+            FC(hidden_size, num_nets, du+do_preproc, tf.keras.activations.swish, 
+                tf.keras.regularizers.L2(0.000025)),
+            FC(hidden_size, num_nets, hidden_size, tf.keras.activations.swish, 
+                tf.keras.regularizers.L2(0.00005)),
+            FC(fc_output, num_nets, hidden_size, None, 
+                tf.keras.regularizers.L2(0.00075)),
             tfp.layers.DistributionLambda(
                 make_distribution_fn=make_distribution_fn,
                 convert_to_tensor_fn=convert_to_tensor_fn)])
     
     negloglik = lambda y, rv_y: -rv_y.log_prob(y)
-    ps_as.compile(optimizer=tf.optimizers.Adam(learning_rate=0.01), loss=negloglik)
+    ps_as.compile(optimizer=tf.optimizers.Adam(learning_rate=0.001), loss=negloglik)
     return ps_as
 
 def get_calibrator():
@@ -150,7 +147,7 @@ def get_calibrator():
         ])
     cal_loss = lambda y, y_pred: tf.reduce_mean(
             tf.nn.sigmoid_cross_entropy_with_logits(y, y_pred))
-    r.compile(optimizer=tf.optimizers.Adam(learning_rate=0.01), loss=cal_loss)
+    r.compile(optimizer=tf.optimizers.Adam(learning_rate=5e-2), loss=cal_loss)
     
     def inv_cal(r, y):
         try:
@@ -180,10 +177,6 @@ def mm_quantile(mm, k, p, n_samples):
     probs = mm.cdf(samples)
     delta = tf.math.abs(probs - p[None, ...])
     idx = tf.argmin(tf.reduce_sum(delta, axis=[-2, -1]))
-    #gather_s = tf.gather_nd(samples, idx)
-    #print(f"gathers: {mm.cdf(samples[idx])}")
-    #print(f"p: {p}")
-    #print(f"delta: {tf.reduce_sum(tf.reduce_sum(mm.cdf(samples[idx])-p))}")
     return samples[idx] 
 
 def prepare_input_for_model(x, num_nets, npart):
@@ -195,11 +188,9 @@ def prepare_input_for_model(x, num_nets, npart):
 def flatten_delta(delta_obs, num_nets, pop_size, npart):
     tmp = tf.reshape(delta_obs, [num_nets, pop_size, npart//num_nets, delta_obs.shape[-1]])
     tmp = tf.transpose(tmp, [1,0,2,3]) #[pop_size, num_nets, npart//num_nets, dim]
-    return tf.reshape(tmp, [-1, delta_obs.shape[-1]]) #[pop_size*npart, dim] if num_nets is multiple of npart
+    return tf.reshape(tmp, [-1, delta_obs.shape[-1]]) #[pop_size*npart, dim] if npart is multiple of num_nets
 
-def ts1(model, obs, act, pop_size, npart, num_nets, num_comp, calibrator=None, inv_cal=None):
-    # Tile observations
-    #tmp_obs = tf.tile(obs, [pop_size, npart, 1])
+def ts1(model, pre_obs, obs, act, pop_size, npart, num_nets, num_comp, calibrator=None, inv_cal=None):
     
     sort_idx = tf.nn.top_k(U.sample([pop_size, npart]), k=npart).indices #[pop_size, npart, npart]
     
@@ -208,7 +199,7 @@ def ts1(model, obs, act, pop_size, npart, num_nets, num_comp, calibrator=None, i
     tmp = tmp[:,  :, None] #[pop_size, npart, 1]
     
     idx = tf.concat([tmp, sort_idx[:,:,None]], axis=-1) #[pop_size,npart,2]
-    tmp_obs = tf.gather_nd(obs, idx) #[pop_size, npart, do']
+    tmp_obs = tf.gather_nd(pre_obs, idx) #[pop_size, npart, do']
 
     s = prepare_input_for_model(tmp_obs, num_nets, npart)
     a = prepare_input_for_model(act, num_nets, npart)
@@ -221,24 +212,18 @@ def ts1(model, obs, act, pop_size, npart, num_nets, num_comp, calibrator=None, i
         ps = inv_cal(calibrator, p)
         ps = tf.clip_by_value(ps, 1e-6, 1 - 1e-6)
         if num_comp == 1: #Check if only one Gauss component => Quantile exists
-            #print(pred_dist.components_distribution.distribution)
             delta_obs = pred_dist.components_distribution.distribution.quantile(ps[..., None, None])
         else:
             delta_obs = mm_quantile(pred_dist, num_comp, ps, n_samples=10)
-        #delta_obs = pred_dist.sample()
     else:
         delta_obs = pred_dist.sample()
 
-    # This is yet another random permutation of the particles. While keeping them on the same population.
-    # TODO: Check there is no variable sort_idxs in the original code.
     delta_obs = flatten_delta(delta_obs, num_nets, pop_size, npart)
     delta_obs = tf.reshape(delta_obs, [pop_size, npart, obs.shape[-1]])
     sort_idx = tf.nn.top_k(-sort_idx,k=npart).indices 
     idx = tf.concat([tmp, sort_idx[:, :, None]], axis=-1)
     delta_obs = tf.gather_nd(delta_obs, idx)
-    #delta_obs = tf.reshape(delta_obs, [-1, delta_obs.shape[-1]]) #[pop_size*npart, do']
 
-    # return tf.tile(obs, [pop_size*npart, 1]) + delta_obs 
     return delta_obs + obs
 
 def get_a_sampler(a_sampler, action_spec):
@@ -251,26 +236,11 @@ def get_ts_sampler(ts_sampler):
     if ts_sampler == 'ts1':
         return ts1
 
-# def empirical_cdf(cdf_pred):
-#     return tf.concat([tf.reduce_mean(
-#         tf.cast(tf.reshape(cdf_pred[:, i], [1,-1])<tf.reshape(cdf_pred[:,i], [1,-1]), tf.float32), 
-#             axis=1, keepdims=True) for i in range(cdf_pred.shape[1])], axis=1)
-
 def empirical_cdf(cdf_pred):
     return tf.concat([tf.reduce_mean(tf.cast(cdf_pred<cdf_pred[i], tf.float32)) for i in range(cdf_pred.shape[0])], axis=0)
 
 def get_env_cost(env):
     if env=='cartpole':
-        def obs_cost(x):
-            return tf.reduce_mean(tf.ones_like(x, tf.float32), axis=-1)
-
-        def act_cost(x):
-            return tf.reduce_mean(tf.ones_like(x, tf.float32), axis=-1)
-
-        def obs_preproc(x):
-            return x
-    
-    elif env=='cartpolem':
         def obs_cost(x):
             x0, theta = x[..., :1], x[..., 1:2]
             h = tf.concat([x0 - 0.6 * tf.sin(theta), -0.6 * tf.cos(theta)], axis=-1)
@@ -297,14 +267,18 @@ def get_env_cost(env):
 
     elif env=='pusher':
         def obs_cost(obs):
-            return -obs[..., 0]
+            tip = obs[..., -9:-6]
+            obj = obs[..., -6:-3]
+            gol = obs[..., -3:]
+            t_o = tf.reduce_sum(tf.abs(obj - tip), axis=-1)
+            o_g = tf.reduce_sum(tf.abs(gol - obj), axis=-1)
+            return .5*t_o + 1.25*o_g 
 
         def act_cost(acs):
             return 0.1 * tf.reduce_sum(tf.square(acs), axis=-1)
 
         def obs_preproc(obs):
-            return tf.concat([obs[..., 1:2], tf.sin(obs[..., 2:3]), 
-                tf.cos(obs[..., 2:3]), obs[..., 3:]], axis=-1)
+            return obs 
     
     elif env=='reacher':
         def obs_cost(obs):

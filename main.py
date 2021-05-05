@@ -13,6 +13,8 @@ from tf_agents.utils import common
 import tensorflow_probability as tfp
 
 def main(args):
+
+    init_time = int(time.time())
     # Load or create args
     if args.load_id is not '0':
         logpath = os.path.join(f'./experiments', args.load_id)
@@ -23,7 +25,6 @@ def main(args):
         exp_id = str(int(time.time()))
         logpath = os.path.join(f'./experiments', exp_id)
         args_filename = os.path.join(logpath, 'args.txt')
-        vars(args)['load_id']=exp_id
         list_returns = []
 
     filename = f'k{args.k}_ph{args.plan_hor}_ps{args.pop_size}_'\
@@ -56,7 +57,7 @@ def main(args):
       env,
       agent.collect_policy,
       observers=replay_observer,
-      num_steps=args.plan_hor)
+      num_steps=args.task_hor)
 
     # Checkpointer
     checkpoint_dir = os.path.join(logpath, 'checkpoint')
@@ -71,12 +72,13 @@ def main(args):
 
     # Reload model
     if args.load_id is not '0':
-        print('Restoring model with exp_id: {args.load_id}')
+        print(f'Restoring model with exp_id: {args.load_id}')
         train_checkpointer.initialize_or_restore()
         global_step = tf.compat.v1.train.get_global_step()
 
     # Initial data collection
     for i in range(args.ninit_rollouts):
+        print(f"Rollout {i}")
         collect_op.run()
 
     # Train the agent and evaluate results
@@ -86,7 +88,7 @@ def main(args):
         collect_op.run()
         dataset = replay_buffer.as_dataset(
                         sample_batch_size=args.batch_size,
-                        num_steps=args.plan_hor,
+                        num_steps=args.task_hor,
                         single_deterministic_pass=True)
 
         # Train the agent
@@ -95,32 +97,35 @@ def main(args):
                 loss = agent.train(trajectories)
         
         # Collect evaluation data from the agent
-        returns = 0
-        for j in range(args.plan_hor):
-            eval_obs = eval_env.step(policy.action(eval_obs))
-            returns += eval_obs.reward
-        list_returns += [returns.numpy()]
+        list_returns+=[tf.reduce_sum(trajectories.reward[-1, :]).numpy()]
+        # returns = 0
+        # for j in range(args.task_hor):
+        #     eval_obs = eval_env.step(policy.action(eval_obs))
+        #     returns += eval_obs.reward
+        # list_returns += [returns.numpy()]
         print(f"train iter {i} Avg.Return:{np.mean(list_returns)}")
 
         # Save checkpoint
         if (i+1)%int(args.save_period) == 0:
-            print("Saving model")
             train_checkpointer.save(global_step)
+            print("Model saved")
 
     #Save results
     np.save(results_filename, np.array(list_returns))
 
     #Save args
+    vars(args)['load_id']=exp_id
     with open(args_filename, 'w') as f:
         json.dump(args.__dict__, f, indent=2)
 
+    total_time = int(time.time()) - init_time
     print(f'Expected reward of {args.k}_{args.calibrate}({args.load_id}) on {args.env} '\
           f'after {agent.train_step_counter.numpy()} interactions: {np.mean(list_returns):.3f}')
 
     # Update results database
     with open('./experiments/exp_list.txt', 'a+') as f:
         f.write(f'{args.env}, {args.k}, {args.calibrate}, {args.num_nets}, {args.load_id}'\
-                f', {agent.train_step_counter.numpy()}, {np.mean(list_returns):.3f}\n')
+                f', {agent.train_step_counter.numpy()}, {np.mean(list_returns):.3f}, {total_time}\n')
     
     # Video agent performance on environments
     if args.video:
@@ -145,7 +150,9 @@ if __name__ == "__main__":
                         help='Number of training iterations. If load, this will \
                               be the number of iterations to continue training the model')
     parser.add_argument('-plan_hor', type=int, default=7,
-                        help='Length of trajectories to sample.')
+                        help='Horizon to plan for.')
+    parser.add_argument('-task_hor', type=int, default=10,
+                        help='Length of trajectories to collect at each iteration.')
     parser.add_argument('-batch_size', type=int, default=3,
                         help='Batch size will be multiplied by plan_hor')
     parser.add_argument('-num_rollout_per_iter', type=int, default=1,
@@ -157,7 +164,7 @@ if __name__ == "__main__":
     # MPC Parameters
     parser.add_argument('-pop_size', type=int, default=10,
                         help='Number of trajectories to sample.')
-    parser.add_argument('-npart', type=int, default=10,
+    parser.add_argument('-npart', type=int, default=20,
                         help='Number of particles. Must be multiple of num_nets')
     parser.add_argument('-a_sampler', type=str, default='random',
                         help='Action sampler.')
@@ -176,7 +183,7 @@ if __name__ == "__main__":
     # Checkpoint parameters
     parser.add_argument('-load_id', type=str, default='0',
             help='Experiment to load.')
-    parser.add_argument('-save_period', type=int, default=25,
+    parser.add_argument('-save_period', type=int, default=10,
             help='Save model period')
     # Agent Paramters
     args = parser.parse_args()
