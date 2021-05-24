@@ -9,11 +9,8 @@ from agent import Agent
 from tf_agents.replay_buffers import tf_uniform_replay_buffer
 from tf_agents.drivers import dynamic_step_driver
 from tf_agents.utils import common
-# Delete if no use
-import tensorflow_probability as tfp
 
 def main(args):
-
     init_time = int(time.time())
     # Load or create args
     if args.load_id is not '0':
@@ -34,32 +31,35 @@ def main(args):
     if not(os.path.exists(logpath)):
         os.makedirs(logpath)
 
-    # Setup learning environments
+    # Setup learning and evaluation environments
     env, video_env = get_env(args.env)
     eval_env, _ = get_env(args.env)
-    
+   
+    # Setup policy
     policy = Policy(env.time_step_spec(), env.action_spec(), None, 
             args.model, args.num_nets, args.k, args.plan_hor, args.npart,
             args.pop_size, args.ts_sampler, args.a_sampler, args.env, args.calibrate)
     
+    #Setup agent
     global_step = tf.compat.v1.train.get_or_create_global_step()
     agent = Agent(policy, train_step_counter=global_step)
     agent.initialize()
 
+    # Buffer to save interactions
     replay_buffer = tf_uniform_replay_buffer.TFUniformReplayBuffer(
                         agent.collect_data_spec,
                         batch_size=1,
                         max_length=1000)
 
+    # Operation to collect experiences and save to buffer.
     replay_observer = [replay_buffer.add_batch]
-
     collect_op = dynamic_step_driver.DynamicStepDriver(
-      env,
-      agent.collect_policy,
-      observers=replay_observer,
-      num_steps=args.task_hor)
+        env,
+        agent.collect_policy,
+        observers=replay_observer,
+        num_steps=args.task_hor)
 
-    # Checkpointer
+    # Training Setup Checkpointer
     checkpoint_dir = os.path.join(logpath, 'checkpoint')
     train_checkpointer = common.Checkpointer(
         ckpt_dir=checkpoint_dir,
@@ -70,7 +70,7 @@ def main(args):
         global_step=global_step
     )
 
-    # Reload model
+    # Reload model if load_id is given.
     if args.load_id is not '0':
         print(f'Restoring model with exp_id: {args.load_id}')
         train_checkpointer.initialize_or_restore()
@@ -96,16 +96,11 @@ def main(args):
             for trajectories, _ in dataset:
                 loss = agent.train(trajectories)
         
-        # Collect evaluation data from the agent
+        # Collect evaluation data from the agent and print
         list_returns+=[tf.reduce_sum(trajectories.reward[-1, :]).numpy()]
-        # returns = 0
-        # for j in range(args.task_hor):
-        #     eval_obs = eval_env.step(policy.action(eval_obs))
-        #     returns += eval_obs.reward
-        # list_returns += [returns.numpy()]
         print(f"train iter {i} Avg.Return:{np.mean(list_returns)}")
 
-        # Save checkpoint
+        # Save model checkpoint
         if (i+1)%int(args.save_period) == 0:
             train_checkpointer.save(global_step)
             print("Model saved")
@@ -117,12 +112,12 @@ def main(args):
     vars(args)['load_id']=exp_id
     with open(args_filename, 'w') as f:
         json.dump(args.__dict__, f, indent=2)
-
+ 
     total_time = int(time.time()) - init_time
     print(f'Expected reward of {args.k}_{args.calibrate}({args.load_id}) on {args.env} '\
           f'after {agent.train_step_counter.numpy()} interactions: {np.mean(list_returns):.3f}')
 
-    # Update results database
+    # Update results csv
     with open('./experiments/exp_list.txt', 'a+') as f:
         f.write(f'{args.env}, {args.k}, {args.calibrate}, {args.num_nets}, {args.load_id}'\
                 f', {agent.train_step_counter.numpy()}, {np.mean(list_returns):.3f}, {total_time}\n')

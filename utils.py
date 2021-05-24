@@ -20,14 +20,14 @@ U = tfd.Uniform()
 
 class FC(keras.layers.Layer):
     """Densely connected NN layer op.
-    Arguments:
+    Args:
         units: Num of units to output.
         num_nets: Num of independent ANNs
         feat_size: Dimensionality of state and action space (i.e. du+do).
         activation: (Optional) 1-argument callable. Activation function to apply to
           outputs.
     Returns:
-        `tf.Tensor`. Output of dense connection.
+        tf.Tensor. Output of dense connection.
     """
     def __init__(self, units, num_nets, feat_size, activation=tf.nn.sigmoid, kernel_regularizer=None):
         super(FC, self).__init__()
@@ -70,6 +70,12 @@ def embed_mp4(filename):
     return IPython.display.HTML(tag)
 
 def video_agent(env, video_env, policy, video_filename, frames=500):
+    """Saves a video of the agent in the environment.
+
+    Args:
+        env: TF Environement.
+        video_env: Py Environement.
+    """
     time_step = env.reset()
     with imageio.get_writer(video_filename, fps=60) as video:
         video.append_data(video_env.render())
@@ -79,6 +85,8 @@ def video_agent(env, video_env, policy, video_filename, frames=500):
     embed_mp4(video_filename)
 
 def load_args(argspath):
+    """ Load arguments from argspath file.
+    """
     parser = ArgumentParser()
     args, unknown = parser.parse_known_args()
     with open(argspath, 'r') as f:
@@ -86,6 +94,14 @@ def load_args(argspath):
     return args 
 
 def get_env(env='cartpole'):
+    """ TF Environment switch.
+
+    Args:
+        env: Environement name.
+    Returns:
+        TF Envitonment.
+        Py Environment.
+    """
     if env == 'cartpole':
         env = suite_gym.load('CartPole-v0')
     if env=='cartpolem':
@@ -97,10 +113,21 @@ def get_env(env='cartpole'):
     if env=='reacher':
         env = suite_gym.load('Reacher-v2')
     return tf_py_environment.TFPyEnvironment(env), env
-    #return env
 
 def get_model(model, num_nets, du, do, do_preproc, k, hidden_size=100):
-    """ To add reward function simply do do+=1. And concatenate the appropiate output.
+    """Creates and compiles an ensemble of Gaussian-Mixtures, each parametrized by 
+    a Neural-Net. PETS corresponds to (model="P", num_nets=5, k=1). PETS++ 
+    corresponds to (model="P", num_nets=5, k=3).
+    Args:
+        model: Type of model.
+        num_nets: Number of networks in the ensemble.
+        du: Dimensionality of action space.
+        do: Dimensionality of state space.
+        do_preproc: Dimensionality of pre-processed state space.
+        k: Number of Mixture Components.
+        hidden_size: Size of hidden layer for each network in ensemble.
+    Returns:
+        tf.Model. Transition probability model p(s|a,s).
     """
     if model[0]=="P":
         convert_to_tensor_fn = lambda s: s.sample()
@@ -136,8 +163,8 @@ def get_model(model, num_nets, du, do, do_preproc, k, hidden_size=100):
 
 def get_calibrator():
     """Calibration function.
-    Arguments:
-          None
+    Args:
+        None
     Returns:
         tf.Model. Output of dense connection.
         function. Inverse call to calibration.
@@ -162,17 +189,27 @@ def get_calibrator():
     return r, inv_cal
 
 def random_sampler(action_spec):
-    """ Assumes action specs are sequential
+    """Returns action-sequence sampler. 
+    Args:
+        action_spec: BoundedArraySpec for the actions in the environment.
+    Returns:
+        Distribution to sample action-sequence.
     """
     mx = action_spec.maximum 
     mn = action_spec.minimum
     if action_spec.dtype == tf.int64:
-        dist = tfd.Categorical(probs=[1/(mx+1)]*(mx+1))
+        return tfd.Categorical(probs=[1/(mx+1)]*(mx+1))
     else:
-        dist = tfd.Uniform(mn, mx)
-    return dist
+        return tfd.Uniform(mn, mx)
 
 def mm_quantile(mm, k, p, n_samples):
+    """Computes quantile of Mixture Model from samples.
+    Args:
+        mm: Mixture Model.
+        k: Number of components in Mixture Model.
+        p: Probability to define quantile Pr(X<p).
+        n_samples: Number of samples to use.
+    """
     samples = mm.sample(k*n_samples)
     probs = mm.cdf(samples)
     delta = tf.math.abs(probs - p[None, ...])
@@ -180,17 +217,42 @@ def mm_quantile(mm, k, p, n_samples):
     return samples[idx] 
 
 def prepare_input_for_model(x, num_nets, npart):
+    """ Divides particles amongst networks in ensemble.
+    Args:
+        x: tf.Tensor 
+        num_nets: Number of networks in ensemble.
+        npart: Number of particles.
+    Returns:
+        tf.Tensor 
+    """
     dim = x.shape[-1]
     tmp = tf.reshape(x, [-1, num_nets, npart // num_nets, dim])
     tmp = tf.transpose(tmp, [1,0,2,3])
-    return tf.reshape(tmp, [num_nets, -1, dim])
+    return tf.reshape(tmp, [num_nets, -1, dim]) 
 
 def flatten_delta(delta_obs, num_nets, pop_size, npart):
+    """ Reshapes model output to match sampled trajectories shape. 
+    """
     tmp = tf.reshape(delta_obs, [num_nets, pop_size, npart//num_nets, delta_obs.shape[-1]])
     tmp = tf.transpose(tmp, [1,0,2,3]) #[pop_size, num_nets, npart//num_nets, dim]
     return tf.reshape(tmp, [-1, delta_obs.shape[-1]]) #[pop_size*npart, dim] if npart is multiple of num_nets
 
 def ts1(model, pre_obs, obs, act, pop_size, npart, num_nets, num_comp, calibrator=None, inv_cal=None):
+    """Trajectory sampling scheme proposed in github.com/kchua/handful-of-trials/blob/master/dmbrl/controllers/MPC.py#L318
+    Args:
+        model: Transition Probability
+        pre_obs: Pre-processed Observation
+        obs: Observation
+        act: Action
+        pop_size: Number of sequences.
+        npart: Number of particles per sequence.
+        num_nets: Number of Mixture Models in ensemble.
+        num_comp: Number of components in each Mixture Model.
+        calibrator: Calibration function.
+        inv_cal: Inverse-Calibration function.
+    Returns:
+        tf.Tensor. Next observation.
+    """
     
     sort_idx = tf.nn.top_k(U.sample([pop_size, npart]), k=npart).indices #[pop_size, npart, npart]
     
@@ -218,8 +280,12 @@ def ts1(model, pre_obs, obs, act, pop_size, npart, num_nets, num_comp, calibrato
     else:
         delta_obs = pred_dist.sample()
 
+    # Reshape delta_obs to match obs shape.
     delta_obs = flatten_delta(delta_obs, num_nets, pop_size, npart)
     delta_obs = tf.reshape(delta_obs, [pop_size, npart, obs.shape[-1]])
+
+    # Another permutation of the particles while keeping them on the same population.
+    # TODO: Verify if model converges faster without this. This makes trajectories inconsistent.
     sort_idx = tf.nn.top_k(-sort_idx,k=npart).indices 
     idx = tf.concat([tmp, sort_idx[:, :, None]], axis=-1)
     delta_obs = tf.gather_nd(delta_obs, idx)
@@ -227,19 +293,44 @@ def ts1(model, pre_obs, obs, act, pop_size, npart, num_nets, num_comp, calibrato
     return delta_obs + obs
 
 def get_a_sampler(a_sampler, action_spec):
+    """Action sampler switch.
+    Args:
+        a_sampler: Action sampler identifier.
+        action_spec: Environment action's BoundedArraySpec.
+    Returns:
+        tfp.distribution. Action sampler.
+    """
     if a_sampler == 'random':
         return random_sampler(action_spec)
     if a_sampler == 'CEM':
         return None
 
 def get_ts_sampler(ts_sampler):
+    """Trajectory Sampler switch.
+    Args:
+        ts_sampler: Trajectory sampler identifier.
+    Returns:
+        function. trajectory sampler.
+    """
     if ts_sampler == 'ts1':
         return ts1
 
 def empirical_cdf(cdf_pred):
+    """Computes empirical cdf from cdf predictions.
+    Args:
+        cdf_pred: tf.Tensor. 
+    """
     return tf.concat([tf.reduce_mean(tf.cast(cdf_pred<cdf_pred[i], tf.float32)) for i in range(cdf_pred.shape[0])], axis=0)
 
 def get_env_cost(env):
+    """Oracle cost functions and preprocessing functions. 
+    Args:
+        env: Environment name.
+    Returns:
+        obs_cost: Observation cost function.
+        act_cost: Action cost function.
+        obs_preproc: Observation pre-processing function.
+    """
     if env=='cartpole':
         def obs_cost(x):
             x0, theta = x[..., :1], x[..., 1:2]

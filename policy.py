@@ -14,15 +14,32 @@ from tf_agents.utils import nest_utils
 U = tfp.distributions.Uniform()
 
 class Policy(tf_policy.TFPolicy):
-    """ Policy
+    """MPC with trajectory sampling.
     """
     def __init__(self, time_step_spec, action_spec, policy_state_spec=(), 
                 model='p', num_nets=1, k=1, plan_hor=12, npart=5, pop_size=10,
-                ts_sampler='ts1', a_sampler='random', env='cartpole', calibrate=None):
+                ts_sampler='ts1', a_sampler='random', env='cartpole', calibrate=False):
+        """ Construct Policy
+        
+        Args:
+            time_step_spec: TimeStep spec emitted by environment.
+            action_spec: Environment action's BoundedTensorSpec.
+            policy_state_spec: 
+            model: Type of model output. ("P": Probabilistic, "D":Deterministic).
+            num_nets: Number of Mixture-Models in ensemble.
+            k: Number of components for each mixture.
+            plan_hor: Horizon to calculate cost of sequence.
+            npart: Number of particles per sequence.
+            pop_size: Number of sequences to consider.
+            ts_sampler: Trajectory sampler identifier.
+            a_sampler: Action sampler identifier.
+            env: Environment name. (Unused)
+            calibrate: Flag to calibrate transition probabilities. 
+        """
         super(Policy, self).__init__(time_step_spec, action_spec, policy_state_spec=())
         self.num_nets = num_nets
         self.do = time_step_spec.observation.shape[0]
-        try:
+        try
             self.du = action_spec.shape[0]
         except IndexError:
             self.du = 1
@@ -44,29 +61,34 @@ class Policy(tf_policy.TFPolicy):
 
     def _action(self, time_step: ts.TimeStep, policy_state: types.NestedTensor = (),
         seed: Optional[types.Seed] = None) -> policy_step.PolicyStep:
-        action_spec = cast(tensor_spec.BoundedTensorSpec, self.action_spec)
+        # Sample pop_size*npart set of random action sequences. Each of length plan_hor.
         act_seq = self.a_sampler.sample([self.plan_hor, self.pop_size, self.npart, self.du])
         # Cast to work with DNN
-        act_seq = tf.cast(act_seq, tf.float32)
         obs = tf.cast(time_step.observation[None, ...], tf.float32)
+        act_seq = tf.cast(act_seq, tf.float32)
+        # Should already be accounted for in sampler but JIC.
         act_seq = tf.clip_by_value(act_seq, self.act_min, self.act_max)
-
+        
+        # Compute cost for a pop_size*npart number of trajectories
         obs = tf.tile(obs, [self.pop_size, self.npart, 1]) 
         cost = tf.zeros([self.pop_size, self.npart], tf.float32)
         for act in act_seq:
             cost += self.act_cost(act) + self.obs_cost(obs)
             pre_obs = self.obs_preproc(obs)
+            # Sample estimated observation from applying act.
             obs = self.ts_sampler(self.model, pre_obs, obs, act, self.pop_size, self.npart, 
                     self.num_nets, self.k, self.calibrator, self.inv_cal)
         
-        # Assign high cost to nan values
+        # Assign high cost to nan values.
         cost = tf.where(tf.math.is_nan(cost), 1e6 * tf.ones_like(cost), cost)
+        # Select action that minimizes cost.
         idx = tf.argmin(tf.reduce_mean(cost, axis=1))
         act = act_seq[0, idx, 0, :]
 
         outer_dims = nest_utils.get_outer_shape(time_step, self._time_step_spec)
         
-        # Cast to take step
+        # Cast to take step - Boilerplate
+        action_spec = cast(tensor_spec.BoundedTensorSpec, self.action_spec)
         action_ = tf.cast(act[None, ...], action_spec.dtype)
         policy_info = tensor_spec.sample_spec_nest(self._info_spec, outer_dims=outer_dims)
         step = policy_step.PolicyStep(action_, policy_state, policy_info)
